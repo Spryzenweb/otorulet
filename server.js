@@ -9,7 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
-});
+}); 
 
 // --- GÜVENLİK VE API AYARLARI ---
 const ADMIN_SECRET_KEY = "gizli-anahtar";
