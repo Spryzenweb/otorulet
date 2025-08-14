@@ -13,7 +13,7 @@ const io = new Server(server, {
 
 const ADMIN_SECRET_KEY = "gizli-anahtar";
 const API_SECRET_KEY = 'BurayaCokGuvenliBirSifreYazin_12345_abcde';
-const PHP_API_URL = 'https://www.sizinsiteniz.com/path/to/api_update_balance.php';
+const PHP_API_URL = 'https://bet.nesligida.com/rulet/api_update_balance.php';
 
 const BET_TIME = 45000;
 const SPIN_TIME = 8000;
