@@ -21,17 +21,15 @@ const io = new Server(server, {
     }
 });
 
-// Middleware
 app.use(cors({
     origin: allowedOrigins,
     credentials: true
 }));
 app.use(express.json());
 
-// Database instance
 const db = new Database();
 
-// Game state
+// GÜVENLİ OYUN DURUMU - Sadece server'da
 const gameState = {
     currentRound: 0,
     sessionId: null,
@@ -39,18 +37,27 @@ const gameState = {
     betsOpen: false,
     countdown: 0,
     winningNumber: null,
-    bets: new Map(), // userId -> Array of bets
-    roundHistory: [],
-    connectedUsers: new Map() // socketId -> userId
+    phase: 'waiting', // waiting, betting, spinning, calculating
+    
+    // Kullanıcı rulet bakiyeleri (site bakiyesinden ayrı)
+    rouletteBalances: new Map(), // userId -> rouletteBalance
+    
+    // Aktif bahisler (round bazında)
+    roundBets: new Map(), // roundId -> Map(userId -> [bets])
+    
+    // Kullanıcı sessionları (bağlantı kopması koruması)
+    userSessions: new Map(), // userId -> { socketId, lastSeen, pendingWins }
+    
+    // Bekleme listesi (bağlantı kopan kullanıcılar için)
+    pendingPayouts: new Map() // userId -> amount
 };
 
 // Game configuration
-const BETTING_DURATION = parseInt(process.env.BETTING_DURATION) || 30; // seconds
-const ROUND_DELAY = parseInt(process.env.ROUND_DELAY) || 10; // seconds between rounds
+const BETTING_DURATION = parseInt(process.env.BETTING_DURATION) || 30;
+const ROUND_DELAY = parseInt(process.env.ROUND_DELAY) || 10;
 const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || 'gizli-anahtar';
 
-// Game logic
-class RouletteGame {
+class SecureRouletteGame {
     constructor() {
         this.countdownTimer = null;
         this.roundTimer = null;
@@ -61,12 +68,15 @@ class RouletteGame {
         if (this.isRunning) return;
         
         this.isRunning = true;
-        console.log('🎰 Rulet oyunu başlatılıyor...');
+        console.log('🔒 Güvenli Rulet sistemi başlatılıyor...');
         
         try {
             // Create game session
             gameState.sessionId = await db.createGameSession();
             console.log(`📋 Oyun oturumu oluşturuldu: ${gameState.sessionId}`);
+            
+            // Bekleyen ödemeleri yükle
+            await this.loadPendingPayouts();
             
             // Start first round
             this.startNewRound();
@@ -76,25 +86,51 @@ class RouletteGame {
         }
     }
 
+    async loadPendingPayouts() {
+        try {
+            // Veritabanından tamamlanmamış ödemeleri yükle
+            const query = `
+                SELECT user_id, SUM(win_amount) as total_pending 
+                FROM pending_payouts 
+                WHERE status = 'pending' 
+                GROUP BY user_id
+            `;
+            const result = await db.query(query);
+            
+            result.forEach(row => {
+                gameState.pendingPayouts.set(row.user_id, row.total_pending);
+            });
+            
+            console.log(`💰 ${result.length} kullanıcı için bekleyen ödeme yüklendi`);
+        } catch (error) {
+            console.error('Pending payouts load error:', error);
+        }
+    }
+
     async startNewRound() {
         if (!this.isRunning) return;
 
         try {
             gameState.currentRound++;
+            gameState.phase = 'betting';
             gameState.betsOpen = true;
             gameState.countdown = BETTING_DURATION;
             gameState.winningNumber = null;
-            gameState.bets.clear();
+            
+            // Yeni round için bahis mapini temizle
+            gameState.roundBets.set(gameState.currentRound, new Map());
 
             // Create round in database
             gameState.currentRoundId = await db.createGameRound(gameState.sessionId, gameState.currentRound);
             
             console.log(`🎯 Yeni tur başladı: ${gameState.currentRound}`);
             
-            // Broadcast new round
+            // Broadcast new round (sadece gerekli bilgiler)
             io.emit('new_round', {
+                roundNumber: gameState.currentRound,
                 countdown: gameState.countdown,
-                roundNumber: gameState.currentRound
+                phase: gameState.phase,
+                betsOpen: gameState.betsOpen
             });
 
             // Start countdown
@@ -113,7 +149,10 @@ class RouletteGame {
             gameState.countdown--;
             
             // Broadcast countdown
-            io.emit('countdown_update', { countdown: gameState.countdown });
+            io.emit('countdown_update', { 
+                countdown: gameState.countdown,
+                phase: gameState.phase 
+            });
 
             if (gameState.countdown <= 0) {
                 this.closeBets();
@@ -128,9 +167,11 @@ class RouletteGame {
         }
 
         gameState.betsOpen = false;
+        gameState.phase = 'closed';
+        
         console.log('🔒 Bahisler kapandı');
         
-        io.emit('bets_closed');
+        io.emit('bets_closed', { phase: gameState.phase });
 
         // Wait a moment then spin
         setTimeout(() => {
@@ -140,19 +181,27 @@ class RouletteGame {
 
     async spinWheel(forcedNumber = null) {
         try {
+            gameState.phase = 'spinning';
+            
             // Generate winning number
-            const winningNumber = forcedNumber !== null ? forcedNumber : Math.floor(Math.random() * 37); // 0-36
+            const winningNumber = forcedNumber !== null ? forcedNumber : Math.floor(Math.random() * 37);
             gameState.winningNumber = winningNumber;
 
             console.log(`🎰 Çark sonucu: ${winningNumber}`);
             
             // Broadcast spin result
-            io.emit('spin_result', { number: winningNumber });
+            io.emit('spin_result', { 
+                number: winningNumber,
+                phase: gameState.phase
+            });
+
+            // Update database immediately
+            await db.finishRound(gameState.currentRoundId, winningNumber, 0, 0);
 
             // Wait for animation then process results
             setTimeout(async () => {
                 await this.processRoundResults(winningNumber);
-            }, 8000); // 8 seconds for wheel animation
+            }, 8000);
         } catch (error) {
             console.error('Spin wheel error:', error);
         }
@@ -160,92 +209,119 @@ class RouletteGame {
 
     async processRoundResults(winningNumber) {
         try {
+            gameState.phase = 'calculating';
+            
+            const currentRoundBets = gameState.roundBets.get(gameState.currentRound);
+            if (!currentRoundBets) {
+                console.log('Bu turda bahis yok');
+                this.scheduleNextRound();
+                return;
+            }
+
             let totalBets = 0;
             let totalPayouts = 0;
-            const userResults = new Map();
+            const payoutPromises = [];
 
-            // Calculate payouts for each user
-            for (const [userId, userBets] of gameState.bets) {
+            // Her kullanıcının bahislerini işle
+            for (const [userId, userBets] of currentRoundBets) {
                 let userTotalBet = 0;
-                let userTotalPayout = 0;
+                let userTotalWin = 0;
 
                 for (const bet of userBets) {
                     userTotalBet += bet.amount;
                     totalBets += bet.amount;
 
                     if (this.isWinningBet(bet, winningNumber)) {
-                        const payout = bet.amount * bet.multiplier;
-                        userTotalPayout += payout;
-                        totalPayouts += payout;
+                        const winAmount = bet.amount * bet.multiplier;
+                        userTotalWin += winAmount;
+                        totalPayouts += winAmount;
                     }
                 }
 
-                if (userTotalPayout > 0) {
-                    // User won
-                    const newBalance = await db.getUserBalance(userId);
-                    await db.updateUserBalance(
-                        userId, 
-                        newBalance + userTotalPayout, 
-                        'win', 
-                        `Rulet kazancı - Tur ${gameState.currentRound}`
-                    );
-                    
-                    userResults.set(userId, {
-                        newBalance: newBalance + userTotalPayout,
-                        winAmount: userTotalPayout,
-                        message: `Tebrikler! ${userTotalPayout} ₺ kazandınız!`
-                    });
-                } else {
-                    // User lost
-                    const newBalance = await db.getUserBalance(userId);
-                    userResults.set(userId, {
-                        newBalance: newBalance,
-                        winAmount: 0,
-                        message: `Maalesef kaybettiniz. Yeni bakiye: ${newBalance} ₺`
-                    });
+                // Kazancı işle (eğer varsa)
+                if (userTotalWin > 0) {
+                    payoutPromises.push(this.processUserPayout(userId, userTotalWin));
                 }
+
+                console.log(`👤 User ${userId}: Bahis: ${userTotalBet}₺, Kazanç: ${userTotalWin}₺`);
             }
 
-            // Finish round in database
-            await db.finishRound(gameState.currentRoundId, winningNumber, totalBets, totalPayouts);
+            // Tüm ödemeleri paralel işle
+            await Promise.all(payoutPromises);
 
-            // Send results to each user
-            for (const [userId, result] of userResults) {
-                const userSockets = Array.from(io.sockets.sockets.values())
-                    .filter(socket => socket.userId === userId);
-                
-                userSockets.forEach(socket => {
-                    socket.emit('round_result', result);
-                });
-            }
+            // Update round stats
+            await db.query(
+                'UPDATE game_rounds SET total_bets = ?, total_payouts = ? WHERE id = ?',
+                [totalBets, totalPayouts, gameState.currentRoundId]
+            );
 
-            // Add to history
-            gameState.roundHistory.unshift({
-                round: gameState.currentRound,
-                number: winningNumber,
-                timestamp: new Date(),
-                totalBets,
-                totalPayouts,
-                profit: totalBets - totalPayouts
+            console.log(`📊 Tur ${gameState.currentRound} tamamlandı. Bahis: ${totalBets}₺, Ödeme: ${totalPayouts}₺`);
+
+            // Broadcast round complete
+            io.emit('round_complete', {
+                roundNumber: gameState.currentRound,
+                winningNumber: winningNumber,
+                totalBets: totalBets,
+                totalPayouts: totalPayouts,
+                phase: 'complete'
             });
 
-            // Keep only last 50 rounds in memory
-            if (gameState.roundHistory.length > 50) {
-                gameState.roundHistory = gameState.roundHistory.slice(0, 50);
-            }
-
-            console.log(`📊 Tur ${gameState.currentRound} tamamlandı. Kazanan: ${winningNumber}, Bahis: ${totalBets}₺, Ödeme: ${totalPayouts}₺`);
-
-            // Start next round after delay
-            setTimeout(() => {
-                if (this.isRunning) {
-                    this.startNewRound();
-                }
-            }, ROUND_DELAY * 1000);
+            this.scheduleNextRound();
 
         } catch (error) {
             console.error('Process round results error:', error);
+            this.scheduleNextRound();
         }
+    }
+
+    async processUserPayout(userId, winAmount) {
+        try {
+            // Site bakiyesine ekle (güvenli)
+            const currentBalance = await db.getUserBalance(userId);
+            const newBalance = currentBalance + winAmount;
+            
+            await db.updateUserBalance(
+                userId, 
+                newBalance, 
+                'roulette_win', 
+                `Rulet kazancı - Tur ${gameState.currentRound}`
+            );
+
+            // Kullanıcıya bildir (eğer bağlıysa)
+            const userSession = gameState.userSessions.get(userId);
+            if (userSession && userSession.socketId) {
+                const socket = io.sockets.sockets.get(userSession.socketId);
+                if (socket) {
+                    socket.emit('payout_received', {
+                        amount: winAmount,
+                        newBalance: newBalance,
+                        roundNumber: gameState.currentRound
+                    });
+                }
+            } else {
+                // Kullanıcı bağlı değil, pending payouts'a ekle
+                const pending = gameState.pendingPayouts.get(userId) || 0;
+                gameState.pendingPayouts.set(userId, pending + winAmount);
+                
+                await db.query(
+                    'INSERT INTO pending_payouts (user_id, win_amount, round_id, status) VALUES (?, ?, ?, ?)',
+                    [userId, winAmount, gameState.currentRoundId, 'pending']
+                );
+            }
+
+        } catch (error) {
+            console.error(`User ${userId} payout error:`, error);
+        }
+    }
+
+    scheduleNextRound() {
+        gameState.phase = 'waiting';
+        
+        setTimeout(() => {
+            if (this.isRunning) {
+                this.startNewRound();
+            }
+        }, ROUND_DELAY * 1000);
     }
 
     isWinningBet(bet, winningNumber) {
@@ -293,47 +369,116 @@ class RouletteGame {
         };
         return multipliers[betType] || 1;
     }
-
-    stop() {
-        this.isRunning = false;
-        if (this.countdownTimer) {
-            clearInterval(this.countdownTimer);
-        }
-        if (this.roundTimer) {
-            clearTimeout(this.roundTimer);
-        }
-        console.log('🛑 Rulet oyunu durduruldu');
-    }
 }
 
 // Initialize game
-const rouletteGame = new RouletteGame();
+const secureGame = new SecureRouletteGame();
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
     console.log(`👤 Kullanıcı bağlandı: ${socket.id}`);
 
-    // Send current game state
+    // Send current game state (sadece gerekli bilgiler)
     socket.emit('game_state', {
+        phase: gameState.phase,
         betsOpen: gameState.betsOpen,
         countdown: gameState.countdown,
         currentRound: gameState.currentRound,
-        winningNumber: gameState.winningNumber,
-        roundHistory: gameState.roundHistory.slice(0, 10)
+        winningNumber: gameState.winningNumber
     });
 
     // Handle user identification
-    socket.on('identify_user', (data) => {
-        socket.userId = data.userId;
-        socket.username = data.username;
-        gameState.connectedUsers.set(socket.id, data.userId);
-        
-        console.log(`🔐 Kullanıcı tanımlandı: ${data.username} (${socket.id})`);
-        
-        db.logAction(data.userId, 'socket_connected', { socketId: socket.id }, socket.handshake.address);
+    socket.on('identify_user', async (data) => {
+        try {
+            socket.userId = data.userId;
+            socket.username = data.username;
+            
+            // Update user session
+            gameState.userSessions.set(data.userId, {
+                socketId: socket.id,
+                lastSeen: new Date(),
+                username: data.username
+            });
+            
+            console.log(`🔐 Kullanıcı tanımlandı: ${data.username} (${socket.id})`);
+            
+            // Bekleyen ödemeleri kontrol et ve gönder
+            const pendingAmount = gameState.pendingPayouts.get(data.userId);
+            if (pendingAmount > 0) {
+                const currentBalance = await db.getUserBalance(data.userId);
+                
+                socket.emit('pending_payout', {
+                    amount: pendingAmount,
+                    message: `Bağlantınız kesilirken ${pendingAmount}₺ kazandınız!`,
+                    newBalance: currentBalance
+                });
+                
+                // Pending'i temizle
+                gameState.pendingPayouts.delete(data.userId);
+                await db.query(
+                    'UPDATE pending_payouts SET status = ? WHERE user_id = ? AND status = ?',
+                    ['delivered', data.userId, 'pending']
+                );
+            }
+            
+            // Rulet bakiyesini gönder
+            const rouletteBalance = gameState.rouletteBalances.get(data.userId) || 0;
+            socket.emit('roulette_balance', { balance: rouletteBalance });
+            
+        } catch (error) {
+            console.error('User identification error:', error);
+        }
     });
 
-    // Handle bet placement
+    // Handle roulette balance transfer
+    socket.on('transfer_to_roulette', async (data) => {
+        try {
+            if (!socket.userId) {
+                socket.emit('transfer_failed', { message: 'Kullanıcı tanımlanmamış!' });
+                return;
+            }
+
+            const { amount } = data;
+            
+            if (amount <= 0 || amount > 100000) {
+                socket.emit('transfer_failed', { message: 'Geçersiz transfer miktarı!' });
+                return;
+            }
+
+            // Site bakiyesini kontrol et
+            const siteBalance = await db.getUserBalance(socket.userId);
+            if (siteBalance < amount) {
+                socket.emit('transfer_failed', { message: 'Yetersiz site bakiyesi!' });
+                return;
+            }
+
+            // Site bakiyesinden düş
+            await db.updateUserBalance(
+                socket.userId,
+                siteBalance - amount,
+                'roulette_transfer',
+                `Rulete transfer: ${amount}₺`
+            );
+
+            // Rulet bakiyesine ekle
+            const currentRouletteBalance = gameState.rouletteBalances.get(socket.userId) || 0;
+            gameState.rouletteBalances.set(socket.userId, currentRouletteBalance + amount);
+
+            socket.emit('transfer_success', {
+                transferAmount: amount,
+                newSiteBalance: siteBalance - amount,
+                newRouletteBalance: currentRouletteBalance + amount
+            });
+
+            console.log(`💸 Transfer: ${socket.username} - ${amount}₺ rulete aktarıldı`);
+
+        } catch (error) {
+            console.error('Transfer error:', error);
+            socket.emit('transfer_failed', { message: 'Transfer işlemi başarısız!' });
+        }
+    });
+
+    // Handle bet placement (server-side validation)
     socket.on('place_bet', async (data) => {
         try {
             if (!gameState.betsOpen) {
@@ -354,38 +499,35 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            // Check user balance
-            const userBalance = await db.getUserBalance(socket.userId);
-            if (userBalance < amount) {
-                socket.emit('bet_failed', { message: 'Yetersiz bakiye!' });
+            // Check roulette balance
+            const rouletteBalance = gameState.rouletteBalances.get(socket.userId) || 0;
+            if (rouletteBalance < amount) {
+                socket.emit('bet_failed', { message: 'Yetersiz rulet bakiyesi!' });
                 return;
             }
 
-            // Deduct bet amount from user balance
-            await db.updateUserBalance(
-                socket.userId, 
-                userBalance - amount, 
-                'bet', 
-                `Rulet bahisi - Tur ${gameState.currentRound}`,
-                gameState.currentRoundId
-            );
+            // Rulet bakiyesinden düş (server-side)
+            gameState.rouletteBalances.set(socket.userId, rouletteBalance - amount);
 
-            // Save bet to database
-            const multiplier = rouletteGame.getPayoutMultiplier(type);
-            await db.saveBet(socket.userId, gameState.currentRoundId, type, value, amount, multiplier);
-
-            // Add bet to game state
-            if (!gameState.bets.has(socket.userId)) {
-                gameState.bets.set(socket.userId, []);
+            // Save bet to current round
+            const currentRoundBets = gameState.roundBets.get(gameState.currentRound);
+            if (!currentRoundBets.has(socket.userId)) {
+                currentRoundBets.set(socket.userId, []);
             }
             
-            gameState.bets.get(socket.userId).push({
+            const multiplier = secureGame.getPayoutMultiplier(type);
+            const bet = {
                 type,
                 value,
                 amount,
                 multiplier,
                 timestamp: new Date()
-            });
+            };
+            
+            currentRoundBets.get(socket.userId).push(bet);
+
+            // Save bet to database
+            await db.saveBet(socket.userId, gameState.currentRoundId, type, value, amount, multiplier);
 
             console.log(`💰 Bahis yapıldı: ${socket.username} - ${type}:${value} - ${amount}₺`);
 
@@ -394,70 +536,19 @@ io.on('connection', (socket) => {
                 type,
                 value,
                 amount,
-                newBalance: userBalance - amount
+                multiplier,
+                newRouletteBalance: rouletteBalance - amount
             });
 
-            // Broadcast bet to other players
-            socket.broadcast.emit('new_bet_placed', {
-                playerName: socket.username,
-                bet: { type, value, amount }
-            });
+            // Update last seen
+            const userSession = gameState.userSessions.get(socket.userId);
+            if (userSession) {
+                userSession.lastSeen = new Date();
+            }
 
         } catch (error) {
             console.error('Place bet error:', error);
             socket.emit('bet_failed', { message: 'Bahis işlemi başarısız!' });
-        }
-    });
-
-    // Admin commands
-    socket.on('admin_command', async (data) => {
-        try {
-            if (data.secret !== ADMIN_SECRET) {
-                socket.emit('admin_error', { message: 'Geçersiz admin şifresi!' });
-                return;
-            }
-
-            console.log(`🔧 Admin komutu: ${data.command}`, data);
-
-            switch (data.command) {
-                case 'force_spin':
-                    if (gameState.betsOpen) {
-                        rouletteGame.closeBets();
-                    }
-                    setTimeout(() => {
-                        rouletteGame.spinWheel(data.forcedNumber);
-                    }, 1000);
-                    
-                    // Log admin action
-                    if (socket.userId) {
-                        await db.query(
-                            'INSERT INTO admin_actions (admin_user_id, action_type, action_data, description) VALUES (?, ?, ?, ?)',
-                            [
-                                socket.userId,
-                                'force_spin',
-                                JSON.stringify({ forcedNumber: data.forcedNumber }),
-                                `Force spin command: ${data.forcedNumber !== null ? data.forcedNumber : 'random'}`
-                            ]
-                        );
-                    }
-                    break;
-
-                case 'get_stats':
-                    const stats = {
-                        currentRound: gameState.currentRound,
-                        connectedUsers: gameState.connectedUsers.size,
-                        totalBets: gameState.bets.size,
-                        roundHistory: gameState.roundHistory.slice(0, 10)
-                    };
-                    socket.emit('admin_stats', stats);
-                    break;
-
-                default:
-                    socket.emit('admin_error', { message: 'Bilinmeyen komut!' });
-            }
-        } catch (error) {
-            console.error('Admin command error:', error);
-            socket.emit('admin_error', { message: 'Komut işlenemedi!' });
         }
     });
 
@@ -466,10 +557,13 @@ io.on('connection', (socket) => {
         console.log(`👤 Kullanıcı ayrıldı: ${socket.id}`);
         
         if (socket.userId) {
-            db.logAction(socket.userId, 'socket_disconnected', { socketId: socket.id }, socket.handshake.address);
+            // Session'ı güncelle ama silme (bağlantı kopması koruması)
+            const userSession = gameState.userSessions.get(socket.userId);
+            if (userSession) {
+                userSession.socketId = null;
+                userSession.lastSeen = new Date();
+            }
         }
-        
-        gameState.connectedUsers.delete(socket.id);
     });
 });
 
@@ -478,37 +572,22 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         uptime: process.uptime(),
-        connectedUsers: gameState.connectedUsers.size,
+        connectedUsers: Array.from(gameState.userSessions.keys()).length,
         currentRound: gameState.currentRound,
-        betsOpen: gameState.betsOpen
+        phase: gameState.phase,
+        pendingPayouts: gameState.pendingPayouts.size
     });
 });
 
-// Start server - Use Render's dynamic PORT
+// Start server
 const PORT = process.env.PORT || 3001;
 
 server.listen(PORT, '0.0.0.0', async () => {
-    console.log(`🚀 Socket server çalışıyor: http://0.0.0.0:${PORT}`);
+    console.log(`🔒 Güvenli Socket server çalışıyor: http://0.0.0.0:${PORT}`);
     console.log(`🌐 CORS: ${allowedOrigins.join(', ')}`);
-    console.log(`📊 Environment: ${process.env.NODE_ENV}`);
     
-    // Start the roulette game
-    await rouletteGame.start();
+    // Start the secure roulette game
+    await secureGame.start();
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-    console.log('🛑 Server kapanıyor...');
-    rouletteGame.stop();
-    await db.close();
-    server.close();
-    process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-    console.log('🛑 Server kapanıyor...');
-    rouletteGame.stop();
-    await db.close();
-    server.close();
-    process.exit(0);
-});
+module.exports = app;
